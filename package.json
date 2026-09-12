@@ -1,0 +1,14 @@
+{
+  "name": "cline-cli",
+  "version": "1.0.0",
+  "description": "A minimal Cline CLI for workspace tasks.",
+  "bin": {
+    "cline": "./cline.js"
+  },
+  "main": "./cline.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}
