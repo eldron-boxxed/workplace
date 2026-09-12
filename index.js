@@ -36,7 +36,7 @@
 
   async function fetchArrasWithHeaders(url, init = {}) {
     const headers = { ...ARRAS_BROWSER_HEADERS, ...(init.headers || {}) };
-    if (ARRAS_CF_CLEARANCE_VALUE) {
+    if (!headers.cookie && ARRAS_CF_CLEARANCE_VALUE) {
       headers.cookie = `${ARRAS_CF_CLEARANCE_NAME}=${ARRAS_CF_CLEARANCE_VALUE}`;
     }
 
@@ -89,18 +89,15 @@
     rMouseDown: false,
     autofire: false,
     autospin: false,
-    // R key override (same toggle pattern as E autofire)
     override: false,
-    // Match leader aim direction at each bot's own position
     copyAim: false,
     manualMode: false,
     manualX: 0,
     manualY: 0,
     noMove: false,
-    // Octant weave — visible on 8-dir WASD
     wavy: true,
     wavyAmp: 6,
-    wavyFreq: 3.927, // ~0.8s full cycle
+    wavyFreq: 3.927,
     isDefender: false,
     chatSpam: "",
     huntName: "",
@@ -114,8 +111,8 @@
 
   function normalizeHuntLabel(text) {
     return String(text || "")
-      .replace(/\[.*?\]/g, " ")       // [clan]
-      .replace(/[|｜].*$/g, " ")        // trailing rank fluff
+      .replace(/\[.*?\]/g, " ")
+      .replace(/[|｜].*$/g, " ")
       .replace(/[^\w\s.\-]/g, " ")
       .replace(/\s+/g, " ")
       .trim()
@@ -127,7 +124,6 @@
     if (got === want) return 100;
     if (got.startsWith(want) || want.startsWith(got)) return 80;
     if (got.includes(want)) return 60;
-    // token overlap
     const wt = want.split(" ").filter(Boolean);
     const gt = got.split(" ").filter(Boolean);
     if (!wt.length) return 0;
@@ -137,8 +133,6 @@
   }
 
   const HUNT_UI_BLOCK = /^(coordinates:|you have|survived|succumbed|respawn|back|reconnect|the server was|vanished)/i;
-
-
 
   const builds = {
     basic: "0/4/6/7/7/7/7/4",
@@ -184,8 +178,6 @@
     rigger: { path: "yjkk", build: "9/9/0/0/0/0/9" },
     doublespread: { path: "yuuy", build: "9/9/0/0/0/0/9" },
     palisade: { path: ["h", "j", "y", [3, 3]], build: "9/9/0/0/0/0/9" },
-    // Smasher line: longer waits are applied in onJoin for "r" steps.
-    // Choice clicks use upgrade_map indices; [3,3] = lower-right style slot.
     spike: { path: ["r", "wait", [3, 3], "wait", "u", "wait", "u"], build: builds.smasher },
     autoshasher: { path: ["r", "wait", [3, 3], "wait", "i"], build: builds.smasher },
     landmine: { path: ["r", "wait", [3, 3], "wait", "h"], build: builds.smasher },
@@ -418,8 +410,6 @@
 
     const toArrayBuffer = function (value) {
       if (!value) { return null; }
-      // SharedArrayBuffer-backed data is already shared memory across
-      // worker threads — don't copy it, just reference it directly.
       if (typeof SharedArrayBuffer !== 'undefined') {
         if (value instanceof SharedArrayBuffer) {
           return new Uint8Array(value);
@@ -563,13 +553,9 @@
       let lastOverride = false;
       let lastChatAt = 0;
       let isJoining = false;
-      let wanderTarget = null; // drift point used before the first A (position) packet arrives
-      const log = function () {
-        // Logging disabled to save RAM
-      };
-      const statusLog = function () {
-        // Logging disabled to save RAM
-      };
+      let wanderTarget = null;
+      const log = function () {};
+      const statusLog = function () {};
 
       let wsMessageCount = 0;
       let wsMessageBytes = 0;
@@ -583,10 +569,6 @@
         log: log,
         updateTarget: (patch) => {
           Object.assign(target, patch);
-          // Defenders always stay in auto-fire + auto-spin: even if an
-          // operator position packet carries autofire=0/autospin=0, snap
-          // the flags back so the E/C toggles pressed during onJoin are
-          // never desynced or cancelled.
           if (target.isDefender) {
             target.autofire = true;
             target.autospin = true;
@@ -598,7 +580,11 @@
             setTimeout(() => trigger.keyup(code), 50);
           }
         },
-        updateClearance: (c) => { gameClearance = c; },
+        updateClearance: (c) => {
+          gameClearance = c;
+          config.clearance = c;
+        },
+        _config: config,
       };
 
       let destroyed = false;
@@ -795,7 +781,6 @@
             let a = Array.from(arguments)
             const screenText = String(a[0] ?? '');
 
-            // Hunt-by-name: score fillText labels and EMA-smooth their screen position
             if (target.huntName && screenText && screenText.length < 32) {
               if (!HUNT_UI_BLOCK.test(screenText.trim())) {
                 const want = normalizeHuntLabel(target.huntName);
@@ -805,7 +790,6 @@
                   const tx = typeof a[1] === 'number' ? a[1] : null;
                   const ty = typeof a[2] === 'number' ? a[2] : null;
                   if (tx != null && ty != null) {
-                    // Prefer better matches; smooth position to reduce jitter
                     if (score >= (target.huntScore || 0) - 5) {
                       const alpha = 0.35;
                       if (target.huntScreenX == null) {
@@ -1095,15 +1079,11 @@
         }
       }
 
-      const WAVE_FINISH_RADIUS = 10; // full straighten inside this
+      const WAVE_FINISH_RADIUS = 10;
       const WAVE_ARRIVE_RADIUS = 5;
-      // Lateral wave half-width (world units). Keep modest so formation
-      // slots stay a clean line instead of scattering.
       const WAVE_WIDTH_DEFAULT = 6;
       const WAVE_WIDTH_MIN = 4;
       const WAVE_WIDTH_MAX = 8;
-      // Shared phase (0) so every bot weaves in sync — the formation
-      // sways as one line instead of each bot wandering offline.
       const wavyPhase = 0;
       let lastHoldKeys = "";
 
@@ -1131,7 +1111,6 @@
           return;
         }
 
-        // Default: drive straight at this bot's own target (formation slot).
         let aimX = x;
         let aimY = y;
 
@@ -1141,7 +1120,6 @@
           if (width < 3) width = WAVE_WIDTH_DEFAULT;
           width = Math.min(WAVE_WIDTH_MAX, Math.max(WAVE_WIDTH_MIN, width));
 
-          // Fade wave in with distance so far bots sway, near bots lock on
           const fade = Math.min(1, Math.max(0, (dist - WAVE_FINISH_RADIUS) / 90));
 
           const swing = Math.sin(
@@ -1151,11 +1129,8 @@
           const inv = 1 / dist;
           const side = swing * width * fade;
 
-          // Perpendicular nudge of the *aim point*, then blend hard back
-          // toward the true target so overall motion stays a converging line.
           const wavedX = x + (-dy0 * inv) * side;
           const wavedY = y + (dx0 * inv) * side;
-          // Max 30% of aim from the wave — 70%+ always true formation target
           const blend = 0.30 * fade;
           aimX = x + (wavedX - x) * blend;
           aimY = y + (wavedY - y) * blend;
@@ -1183,7 +1158,6 @@ async function onJoin() {
   isJoining = true;
   died2 = false;
 
-  // Don't block the main movement/aim loop while upgrading.
   block = false;
   inGame = true;
 
@@ -1209,18 +1183,15 @@ async function onJoin() {
       log(`[Bot 0] Feed mode: randomly selected path for ${randomTank}`);
   }
 
-  // Upgrades run independently while movement/aim continues.
   isUpgrading = true;
 
   try {
     isUpgradingPath = true;
     for (const key of upgradePath) {
       if (key === "wait") {
-        // Smasher/spike line needs real delay so the choice UI is up
         await waitTime(180);
       } else if (key instanceof Array) {
         await waitTime(120);
-        // click choice slot; retry once if menu is laggy
         await controller.click(
           upgrade_map[key[0]],
           upgrade_map[key[1]]
@@ -1233,7 +1204,6 @@ async function onJoin() {
         await waitTime(150);
       } else {
         const k = String(key).toUpperCase();
-        // Opening smasher branch (R) needs extra settle time
         if (k === "R") {
           await waitTime(100);
           controller.press("KeyR");
@@ -1289,17 +1259,9 @@ async function onJoin() {
       trigger.keydown("Key" + key.toUpperCase());
     }
 
-    // Only press E once fully out of the upgrade window — the main
-    // loop's autofire toggle (isUpgrading-gated) handles the initial press.
     lastAutofire = false;
 
     if (target.isDefender) {
-      // Defenders always enable auto-fire + auto-spin the instant they're
-      // out of the upgrade window so they start shooting immediately and
-      // spin continuously. E = auto-fire toggle, C = auto-spin toggle: a
-      // single press each flips them on, and we keep the game's toggle
-      // state synced with lastAutofire/lastAutospin so the main loop's
-      // toggle guards never issue a second (cancelling) press.
       controller.press("KeyE");
       lastAutofire = true;
       target.autofire = true;
@@ -1335,10 +1297,8 @@ const mainInterval = setInterval(function () {
           if (lastHash !== global.location.hash) {
             const newHash = global.location.hash;
             lastHash = newHash;
-            // Propagate the resolved team code hash so reconnects use it
             if (config.hash !== newHash) {
               config.hash = newHash;
-              
             }
           }
           let at = timeouts[i]
@@ -1366,16 +1326,14 @@ const mainInterval = setInterval(function () {
             setTimeout(onJoin, needsDelay ? 1200 : 100);
           }
           if (inGame && config.type === 'follow') {
-            // No movement until the tank upgrade path is done
             if (isUpgradingPath) {
               stopMoving();
             }
             let moveTarget = { x: 0, y: 0 };
             let aimTarget = { x: 0, y: 0 };
             let valid = false;
-            let didMove = false; // true if this branch already called pathfind/stopMoving
+            let didMove = false;
 
-            // ── noMove: hard stop WASD, aim only ──
             if (target.noMove) {
               stopMoving();
               didMove = true;
@@ -1388,7 +1346,6 @@ const mainInterval = setInterval(function () {
                 aimTarget.y = target.y + (target.mouseY || 0);
               }
             }
-            // ── name hunt ──
             else {
               const huntAge = target.huntSeenAt ? (Date.now() - target.huntSeenAt) : 1e9;
               const huntLive = !!(target.huntName && target.huntScreenX != null && huntAge < 2500);
@@ -1438,9 +1395,6 @@ const mainInterval = setInterval(function () {
                 moveTarget.x = target.x;
                 moveTarget.y = target.y;
                 if (target.isDefender) {
-                  // Defenders always walk to your exact position — never
-                  // pulled off course by the aim/mouse offset — but still
-                  // aim normally so they can fight while sticking close.
                   aimTarget.x = target.x + (target.mouseX || 0);
                   aimTarget.y = target.y + (target.mouseY || 0);
                 } else if (target.followMouse && !target.autospin) {
@@ -1454,10 +1408,6 @@ const mainInterval = setInterval(function () {
                 }
                 valid = true;
               } else {
-                // Freshly spawned bot with no operator position yet — it's
-                // waiting before the first A (position) packet reaches this
-                // worker. Wander lazily so it cruises instead of parking
-                // in place; the wave still applies so it looks natural.
                 if (!wanderTarget ||
                     Math.hypot(wanderTarget.x - position[0], wanderTarget.y - position[1]) < 40) {
                   const ang = Math.random() * Math.PI * 2;
@@ -1480,8 +1430,6 @@ const mainInterval = setInterval(function () {
               }
             }
 
-            // Copy leader aim: same direction vector at *this* bot's position.
-            // Movement / formation targets are left alone — only the barrel turns.
             if (target.copyAim && !target.autospin) {
               aimTarget.x = position[0] + (target.mouseX || 0);
               aimTarget.y = position[1] + (target.mouseY || 0);
@@ -1489,7 +1437,6 @@ const mainInterval = setInterval(function () {
             }
 
             if (valid) {
-              // Only pathfind if this frame did not already handle move (noMove/hunt)
               if (!didMove) {
                 if (position[2] > 0 && !isUpgradingPath) {
                   pathfind(moveTarget.x, moveTarget.y);
@@ -1498,9 +1445,6 @@ const mainInterval = setInterval(function () {
                 }
               }
 
-              // Aim (skip if hunt already set mouse, or if Follow Mouse
-              // is off and there's no other aim source — keep facing
-              // whatever direction the bot already had)
               const noAimSource = target.x !== undefined && target.x !== null && !target.isDefender && !target.followMouse && !target.shift && !target.manualMode && !target.noMove;
               if (!noAimSource && (!target.huntName || !(target.huntSeenAt && (Date.now() - target.huntSeenAt) < 5000))) {
                 let angle;
@@ -1517,30 +1461,23 @@ const mainInterval = setInterval(function () {
               }
             }
 
-            // Suppress both mouse buttons while upgrade path is running
             const firingBlocked = isUpgrading || isJoining;
             controller[(target.mouseDown && !target.feed && !firingBlocked) ? "mouseDown" : "mouseUp"]()
             controller[(target.rMouseDown && !target.feed && !firingBlocked) ? "mouseDown" : "mouseUp"](2)
 
-            // Auto-fire toggle (E) — suppressed during upgrade so the
-            // E press can't leak in mid-path
             if (!isUpgrading && !!target.autofire !== !!lastAutofire) {
               controller.press("KeyE");
               lastAutofire = !!target.autofire;
             }
-            // Override toggle (R) — same pattern as E autofire
             if (!isUpgrading && !!target.override !== !!lastOverride) {
               controller.press("KeyR");
               lastOverride = !!target.override;
             }
-            // Auto-spin toggle (C) — real game spin, not orbit
             if (!!target.autospin !== !!lastAutospin) {
               controller.press("KeyC");
               lastAutospin = !!target.autospin;
             }
-            // If game somehow desynced spin off while flag is on, re-press occasionally
             if (target.autospin && lastAutospin) {
-              // no-op; state matched
             }
 
             if (target.chatSpam && Date.now() - lastChatAt > 3000) {
@@ -1630,6 +1567,12 @@ const mainInterval = setInterval(function () {
           let options = args[1] || {};
           if (proxyAgent) {
             options.agent = proxyAgent;
+          }
+          if (gameClearance && gameClearance.value) {
+            options.headers = Object.assign({}, options.headers || {}, {
+              cookie: `cf_clearance=${gameClearance.value}`,
+              'user-agent': gameClearance.userAgent
+            });
           }
           args[1] = options;
 
@@ -1743,7 +1686,6 @@ const mainInterval = setInterval(function () {
 
           let closed = false
           d.addEventListener('message', function (e) {
-            // ws stats disabled
           })
           d.send = new Proxy(d.send, { apply: function (f, g, h) { return Reflect.apply(f, g, h) } })
           d.close = new Proxy(d.close, {
@@ -1921,6 +1863,7 @@ const mainInterval = setInterval(function () {
     } else if (message.type === 'clearance_update') {
       for (const bot of currentBotInterfaces) {
         if (bot && bot.updateClearance) bot.updateClearance(message.clearance);
+        if (bot && bot._config) bot._config.clearance = message.clearance;
       }
     } else if (message.type == 'destroy') {
       devastate();
