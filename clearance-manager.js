@@ -1,7 +1,10 @@
+// language: JavaScript, file: clearance-manager.js
 const { chromium } = require('playwright');
 
 const cache = new Map();
 const inflight = new Map();
+
+const CACHE_SAFETY_SEC = 90;
 
 function normalizeProxy(proxyUrl) {
   if (!proxyUrl || proxyUrl === 'direct' || proxyUrl === 'null') {
@@ -29,6 +32,22 @@ function parseProxy(proxyUrl) {
 
 function proxyCookieKey(proxyUrl) {
   return normalizeProxy(proxyUrl);
+}
+
+// [FIX] freshness check now handles -1 session cookies correctly
+function isFresh(entry) {
+  if (!entry) return false;
+  if (entry.expiry === -1) return true;
+  return entry.expiry > Math.floor(Date.now() / 1000) + CACHE_SAFETY_SEC;
+}
+
+// [FIX] synchronous peek so spawnBotNow can embed the cookie in the
+// initial worker config without awaiting.
+function peekClearance(proxyUrl) {
+  const key = proxyCookieKey(proxyUrl);
+  const entry = cache.get(key);
+  if (isFresh(entry)) return entry;
+  return null;
 }
 
 async function solveClearance(proxyUrl) {
@@ -81,7 +100,7 @@ async function solveClearance(proxyUrl) {
     });
   });
 
-  await page.goto('https://arras.io', { waitUntil: 'domcontentloaded', timeout: 10000 });
+  await page.goto('https://arras.io', { waitUntil: 'domcontentloaded', timeout: 15000 });
 
   const started = Date.now();
   const deadline = started + 90000;
@@ -98,29 +117,31 @@ async function solveClearance(proxyUrl) {
   }
 
   const finalUserAgent = await page.evaluate(() => navigator.userAgent);
+  await browser.close();
+
   if (!found) {
-    await browser.close();
     throw new Error('Cloudflare clearance not found');
   }
 
-  const expiry = Number(found.expires || Math.floor(Date.now() / 1000) + 3600);
-  const result = {
+  // [FIX] Preserve -1 (session cookie) instead of normalizing to a fake expiry
+  const rawExpiry = Number(found.expires);
+  const expiry = (Number.isFinite(rawExpiry) && rawExpiry > 0)
+    ? rawExpiry
+    : -1;
+
+  return {
     value: found.value,
     userAgent: finalUserAgent,
     expiry,
     proxy: proxyUrl || 'direct',
-    earnedAt: Date.now()
+    earnedAt: Math.floor(Date.now() / 1000)
   };
-
-  await browser.close();
-
-  return result;
 }
 
 async function getClearance(proxyUrl) {
   const key = proxyCookieKey(proxyUrl);
   const cached = cache.get(key);
-  if (cached && cached.expiry > Date.now() / 1000 + 90) {
+  if (isFresh(cached)) {
     return cached;
   }
 
@@ -147,4 +168,4 @@ function invalidate(proxyUrl) {
   inflight.delete(key);
 }
 
-module.exports = { getClearance, invalidate };
+module.exports = { getClearance, invalidate, peekClearance };
