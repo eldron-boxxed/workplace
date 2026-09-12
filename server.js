@@ -9,7 +9,7 @@
     const fetchModule = await import("node-fetch");
     const { HttpsProxyAgent } = await import("https-proxy-agent");
     const realFetch = fetchModule.default || fetchModule;
-    const { getClearance, invalidate } = require("./clearance-manager");
+    const { getClearance, invalidate, peekClearance } = require("./clearance-manager");
 
     const rawLog = console.log.bind(console);
     const noop = () => {};
@@ -30,11 +30,6 @@
     const MAX_WORKERS = parseInt(process.env.ARRAS_MAX_WORKERS || "256", 10) || 256;
     const MAX_BOTS_GLOBAL = Math.max(50, parseInt(process.env.ARRAS_MAX_BOTS || "6000", 10) || 6000);
     const PROXY_REFRESH_MS = parseInt(process.env.ARRAS_PROXY_REFRESH_MS || "180000", 10) || 180000;
-    // Spawn is sequential (no staggered parallel job) so requested counts
-    // fill as fast as proxies/workers allow.
-    // Allow proxy-less (direct) spawns as a last resort when the proxy pool is
-    // empty. OFF by default: one IP can only hold so many connections before
-    // the server flags it. Enable with ARRAS_ALLOW_DIRECT=1.
     const ALLOW_DIRECT = process.env.ARRAS_ALLOW_DIRECT === "1";
     const ARRAS_WS_PROTOCOLS = ["arras.io#v1.4+sls+et0", "arras.io"];
 
@@ -60,7 +55,7 @@
             ...(init.headers || {})
         };
 
-        if (ARRAS_CF_CLEARANCE_VALUE) {
+        if (!headers.cookie && ARRAS_CF_CLEARANCE_VALUE) {
             headers.cookie = `${ARRAS_CF_CLEARANCE_NAME}=${ARRAS_CF_CLEARANCE_VALUE}`;
         }
 
@@ -144,8 +139,6 @@
                 })
             );
 
-            // Only swap the live pool when the fetch actually found something —
-            // a bad network moment must not wipe the pool entirely.
             if (all.size) {
                 PROXY_POOL = Array.from(all).slice(0, MAX_PROXIES);
 
@@ -162,16 +155,11 @@
     }
 
     async function rankProxies(defenderCount = 0) {
-        // Ranking is ONLY for defenders — regular follow bots draw straight
-        // from session.proxyQueue and don't care about latency. Skip the entire
-        // latency pass unless there are defenders to feed.
         if (!PROXY_POOL.length || isRankingProxies) return;
         if (!(defenderCount > 0)) return;
         isRankingProxies = true;
 
         try {
-            // Only rank as many proxies as the defender spawn actually needs —
-            // no reason to latency-test thousands for a handful of defenders.
             const want = Math.min(Math.ceil(defenderCount * 1.5) + 4, PROXY_POOL.length);
             const candidates = PROXY_POOL.slice(0, want);
 
@@ -194,8 +182,6 @@
                 })
             );
 
-            // Fastest first. Only the tested slice goes into the ranked queue;
-            // the untested tail of the pool stays untouched for regular bots.
             const ranked = results.filter(Boolean).sort((a, b) => a.ms - b.ms);
             PROXY_RANKED = ranked.map((r) => r.proxyUrl);
 
@@ -210,18 +196,14 @@
     }
 
     function takeUniqueProxy(session, best = false) {
-        // Defenders draw from the latency-ranked head of the pool
         if (best && PROXY_RANKED.length) return PROXY_RANKED.shift();
 
         if (!session.proxyQueue || session.proxyQueue.length === 0) {
-            // Queue ran dry — refill once from the live pool so long-running
-            // farms keep spawning instead of dying out.
             if (PROXY_POOL.length) {
                 session.proxyQueue = PROXY_POOL.slice();
                 return session.proxyQueue.pop();
             }
 
-            // No proxies anywhere right now — direct fallback when enabled.
             if (ALLOW_DIRECT) return "";
 
             return null;
@@ -233,13 +215,11 @@
     let arrasScriptCache = null;
     let arrasWasmCache = null;
 
-
     function countLiveBotsForSession(session) {
         let n = 0;
         if (!session) return 0;
         for (const w of session.workers || []) n += w.activeBots || 0;
         for (const w of session.pool || []) n += w.activeBots || 0;
-        // protocol-only clients also count as live bots on this runner
         if (Array.isArray(session.protocolClients)) {
             n += session.protocolClients.filter((c) => c && !c.dead).length;
         }
@@ -249,8 +229,6 @@
     function pushLiveBotCount(session, packetFn) {
         if (typeof packetFn !== "function") return;
         try {
-            // Prefer process-wide active count (one workflow = one farm).
-            // Fallback to session workers if global drifts.
             const live = Math.max(activeBotCount, countLiveBotsForSession(session));
             packetFn("N", live, totalSpawned);
         } catch {}
@@ -282,7 +260,30 @@
 
     async function preloadArrasAssets() {
         try {
-            const htmlResponse = await fetchArrasWithHeaders("https://arras.io");
+            const bootstrapProxy =
+                process.env.ARRAS_PRELOAD_PROXY ||
+                (PROXY_POOL.length ? PROXY_POOL[0] : null);
+
+            let bootstrapClearance = null;
+            if (bootstrapProxy) {
+                try {
+                    bootstrapClearance = await getClearance(bootstrapProxy);
+                    rawLog(`[preload] earned clearance for ${bootstrapProxy}`);
+                } catch (err) {
+                    rawLog(`[preload] clearance fetch failed: ${err && err.message ? err.message : err}`);
+                }
+            }
+
+            const cfHeader = bootstrapClearance
+                ? {
+                    cookie: `cf_clearance=${bootstrapClearance.value}`,
+                    "user-agent": bootstrapClearance.userAgent
+                }
+                : {};
+
+            const htmlResponse = await fetchArrasWithHeaders("https://arras.io", {
+                headers: cfHeader
+            });
 
             if (!htmlResponse.ok) {
                 throw new Error(
@@ -296,7 +297,9 @@
             }
 
             rawLog("[preload] fetching https://arras.io/app.wasm ...");
-            const wasmResponse = await fetchArrasWithHeaders("https://arras.io/app.wasm");
+            const wasmResponse = await fetchArrasWithHeaders("https://arras.io/app.wasm", {
+                headers: cfHeader
+            });
 
             if (!wasmResponse.ok) {
                 throw new Error(
@@ -310,9 +313,6 @@
                 throw new Error("Arras WASM response was empty");
             }
 
-            // Copy into a SharedArrayBuffer once. postMessage shares
-            // SharedArrayBuffer memory across worker threads by reference
-            // instead of structured-cloning a private copy per worker.
             const sharedBuf = new SharedArrayBuffer(wasmBuffer.byteLength);
             new Uint8Array(sharedBuf).set(new Uint8Array(wasmBuffer));
 
@@ -445,21 +445,11 @@
     }
 
     function spawnBotNow(session, hash, botName, isDefender) {
-        // Global farm cap — an "#F 1500" style request breaks out here instead
-        // of silently spawning past the target.
         if (activeBotCount >= MAX_BOTS_GLOBAL) return false;
 
         const proxyUrl = takeUniqueProxy(session, isDefender);
 
-        // null = no proxy available and direct mode disabled. An empty string
-        // means a proxy-less (direct) spawn was explicitly allowed.
         if (proxyUrl === null) return false;
-
-        let spawnClearance = null;
-        if (proxyUrl) {
-            try { spawnClearance = getClearance(proxyUrl); }
-            catch (err) { rawLog(`[clearance] spawn fetch failed: ${err.message}`); }
-        }
 
         const worker = acquireWorker(session, isDefender);
         const botId = session.nextBotId++;
@@ -467,6 +457,21 @@
         worker.botId = botId;
         worker.botIds.push(botId);
         worker.activeBots++;
+
+        let spawnClearance = null;
+        if (proxyUrl) {
+            const cached = peekClearance(proxyUrl);
+            if (cached) {
+                spawnClearance = cached;
+            } else {
+                getClearance(proxyUrl)
+                    .then((c) => worker.send({ type: "clearance_update", clearance: c }))
+                    .catch((err) => {
+                        invalidate(proxyUrl);
+                        rawLog(`[clearance] spawn fetch failed: ${err.message}`);
+                    });
+            }
+        }
 
         let selectedTank = session.tank;
 
@@ -478,12 +483,6 @@
 
         const rawHash = String(hash || "").replace(/^#/, "");
 
-        // Hash rules:
-        // - Normal F bots: once a worker resolves the party code to a full
-        //   hash, reuse session.resolvedHash so later bots actually join.
-        //   (Using only the short code every time was breaking joins.)
-        // - Defenders: always use the hash from the D packet (client sends
-        //   location.hash), stored as session.playerHash — not the F field.
         let spawnHash;
         if (isDefender) {
             if (rawHash) session.playerHash = rawHash;
@@ -491,7 +490,6 @@
             spawnHash = defHash ? "#" + String(defHash).replace(/^#/, "") : "#";
         } else {
             if (rawHash && session.partyKey !== rawHash) {
-                // New party code from Ext Server Hash — clear old resolve
                 session.partyKey = rawHash;
                 session.resolvedHash = null;
             }
@@ -523,9 +521,6 @@
                     tank: selectedTank,
                     isDefender: !!isDefender,
                     buildOverride: session.botBuild || "",
-                    // Seed new spawns with the latest known operator
-                    // position so they steer immediately instead of
-                    // idling until the next A (position) packet arrives.
                     ...(session.lastA ? {
                         x: session.lastA.payload.x,
                         y: session.lastA.payload.y,
@@ -544,10 +539,6 @@
             }
         });
 
-        // Push the cached position to this worker right away. The bot just
-        // spawned with the same coords in initialTarget, and this live
-        // update guarantees every bot on the worker (old and new) has a
-        // target heading so WASD triggers immediately.
         if (session.lastA) {
             worker.send(
                 isDefender
@@ -584,7 +575,6 @@
                 continue;
             }
 
-            // Proxy miss — try refetch once, then keep going a few times
             staleMisses++;
             if (staleMisses === 1) {
                 rawLog(
@@ -603,7 +593,6 @@
                 break;
             }
 
-            // Retry this slot instead of consuming it on a dead proxy miss
             i--;
         }
 
@@ -622,14 +611,7 @@
             const fd = fs.openSync(filePath, "r");
             const buffer = Buffer.alloc(stat.size - start);
 
-            fs.readSync(
-                fd,
-                buffer,
-                0,
-                buffer.length,
-                start
-            );
-
+            fs.readSync(fd, buffer, 0, buffer.length, start);
             fs.closeSync(fd);
 
             return buffer.toString("utf8");
@@ -639,11 +621,7 @@
     }
 
     function getKnownArrasBuildId() {
-        if (
-            /^[a-f0-9]{16}$/i.test(
-                process.env.ARRAS_BUILD_ID || ""
-            )
-        ) {
+        if (/^[a-f0-9]{16}$/i.test(process.env.ARRAS_BUILD_ID || "")) {
             return process.env.ARRAS_BUILD_ID;
         }
 
@@ -658,18 +636,11 @@
         ];
 
         for (const file of files) {
-            const text = readTailText(
-                path.join(__dirname, file)
-            );
+            const text = readTailText(path.join(__dirname, file));
 
             const matches = [
-                ...[...text.matchAll(
-                    /[?&]b=([a-f0-9]{16})/gi
-                )].map((m) => m[1]),
-
-                ...[...text.matchAll(
-                    /"b"\s*:\s*"([a-f0-9]{16})"/gi
-                )].map((m) => m[1])
+                ...[...text.matchAll(/[?&]b=([a-f0-9]{16})/gi)].map((m) => m[1]),
+                ...[...text.matchAll(/"b"\s*:\s*"([a-f0-9]{16})"/gi)].map((m) => m[1])
             ];
 
             if (matches.length) {
@@ -681,18 +652,11 @@
     }
 
     function getBrowserProvenSocketTimestamp(buildId) {
-        if (
-            /^\d{8,12}$/.test(
-                process.env.ARRAS_SOCKET_T || ""
-            )
-        ) {
+        if (/^\d{8,12}$/.test(process.env.ARRAS_SOCKET_T || "")) {
             return process.env.ARRAS_SOCKET_T;
         }
 
-        const escaped = String(buildId || "").replace(
-            /[.*+?^${}()|[\]\\]/g,
-            "\\$&"
-        );
+        const escaped = String(buildId || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
         if (!escaped) return "";
 
@@ -717,10 +681,7 @@
         );
 
         for (const file of files) {
-            const text = readTailText(
-                path.join(__dirname, file),
-                4 * 1048576
-            );
+            const text = readTailText(path.join(__dirname, file), 4 * 1048576);
 
             const matches = [
                 ...[...text.matchAll(urlPat)].map((m) => m[1]),
@@ -735,16 +696,10 @@
         return "";
     }
 
-    async function fetchJsonWithTimeout(
-        fetchUrl,
-        timeoutMs = 3000
-    ) {
+    async function fetchJsonWithTimeout(fetchUrl, timeoutMs = 3000) {
         const controller = new AbortController();
 
-        const timer = setTimeout(
-            () => controller.abort(),
-            timeoutMs
-        );
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
 
         try {
             const response = await realFetch(fetchUrl, {
@@ -757,35 +712,20 @@
         }
     }
 
-    async function probeSocketUrl(
-        socketUrl,
-        timeoutMs = 2500
-    ) {
+    async function probeSocketUrl(socketUrl, timeoutMs = 2500) {
         return new Promise((resolve, reject) => {
             const socket = new WebSocket(
                 socketUrl,
                 ARRAS_WS_PROTOCOLS,
                 {
                     headers: {
-                        "user-agent":
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-
-                        "accept-encoding":
-                            "gzip, deflate, br, zstd",
-
-                        "accept-language":
-                            "en-US,en;q=0.9",
-
-                        "origin":
-                            "https://arras.io",
-
-                        "cache-control":
-                            "no-cache",
-
-                        "pragma":
-                            "no-cache"
+                        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                        "accept-encoding": "gzip, deflate, br, zstd",
+                        "accept-language": "en-US,en;q=0.9",
+                        "origin": "https://arras.io",
+                        "cache-control": "no-cache",
+                        "pragma": "no-cache"
                     },
-
                     origin: "https://arras.io"
                 }
             );
@@ -813,22 +753,8 @@
             );
 
             socket.once("open", () => done());
-
-            socket.once(
-                "error",
-                (err) => done(
-                    err || new Error("probe-error")
-                )
-            );
-
-            socket.once(
-                "close",
-                () => done(
-                    new Error(
-                        "probe-closed-before-open"
-                    )
-                )
-            );
+            socket.once("error", (err) => done(err || new Error("probe-error")));
+            socket.once("close", () => done(new Error("probe-closed-before-open")));
         });
     }
 
@@ -839,9 +765,7 @@
     ];
 
     async function resolveSocketUrlDirect(hash) {
-        const normalized = String(hash || "")
-            .replace(/^#/, "")
-            .trim();
+        const normalized = String(hash || "").replace(/^#/, "").trim();
 
         const statusKeys = [normalized];
 
@@ -861,20 +785,15 @@
 
         for (const statusUrl of DIRECT_STATUS_URLS) {
             try {
-                const statusJson =
-                    await fetchJsonWithTimeout(statusUrl);
+                const statusJson = await fetchJsonWithTimeout(statusUrl);
 
                 let row = null;
                 let statusKey = "";
 
                 for (const candidate of statusKeys) {
-                    const candidateRow =
-                        statusJson?.status?.[candidate];
+                    const candidateRow = statusJson?.status?.[candidate];
 
-                    if (
-                        candidateRow?.online &&
-                        candidateRow.host
-                    ) {
+                    if (candidateRow?.online && candidateRow.host) {
                         row = candidateRow;
                         statusKey = candidate;
                         break;
@@ -885,17 +804,13 @@
                     continue;
                 }
 
-                const timestamp =
-                    getBrowserProvenSocketTimestamp(buildId);
+                const timestamp = getBrowserProvenSocketTimestamp(buildId);
 
                 if (!timestamp) {
-                    throw new Error(
-                        "missing-browser-proven-t"
-                    );
+                    throw new Error("missing-browser-proven-t");
                 }
 
-                const socketUrl =
-                    `wss://${row.host}/?a=3&b=${buildId}&t=${timestamp}`;
+                const socketUrl = `wss://${row.host}/?a=3&b=${buildId}&t=${timestamp}`;
 
                 await probeSocketUrl(socketUrl);
 
@@ -911,251 +826,122 @@
             }
         }
 
-        throw lastError ||
-            new Error("missing-status-row");
+        throw lastError || new Error("missing-status-row");
     }
 
 
-    function launchProtocolOnlyClients(
-        session,
-        ws,
-        hash,
-        socketUrl,
-        options = {}
-    ) {
-        const count = Math.max(
-            1,
-            Math.min(
-                parseInt(options.count, 10) || 1,
-                50
-            )
-        );
+    function launchProtocolOnlyClients(session, ws, hash, socketUrl, options = {}) {
+        const count = Math.max(1, Math.min(parseInt(options.count, 10) || 1, 50));
 
-        const requestedDelay =
-            parseInt(options.delay, 10);
+        const requestedDelay = parseInt(options.delay, 10);
 
-        const delay = Math.max(
-            0,
-            Number.isFinite(requestedDelay)
-                ? requestedDelay
-                : count > 1
-                    ? 500
-                    : 0
-        );
+        const delay = Math.max(0, Number.isFinite(requestedDelay) ? requestedDelay : count > 1 ? 500 : 0);
 
-        const botName =
-            options.botName === undefined || options.botName === null
-                ? ""
-                : String(options.botName).trim();
+        const botName = options.botName === undefined || options.botName === null ? "" : String(options.botName).trim();
 
-        const party =
-            String(hash || "")
-                .replace(/^#/, "")
-                .match(/\d+$/)?.[0] || "";
+        const party = String(hash || "").replace(/^#/, "").match(/\d+$/)?.[0] || "";
 
-        const scriptPath =
-            path.join(
-                __dirname,
-                "protocol-only-random-client.js"
-            );
+        const scriptPath = path.join(__dirname, "protocol-only-random-client.js");
 
-        // Staggered parallel protocol-only spawn: each child gets its own
-        // proxy so dead proxies are skipped instead of shared by all N.
         for (let i = 0; i < count; i++) {
             const timer = setTimeout(() => {
                 const proxyUrl = takeUniqueProxy(session);
                 if (proxyUrl === null && !ALLOW_DIRECT) {
-                    rawLog(
-                        `[protocol-spawn] no proxy for child ${i + 1}/${count} — skip`
-                    );
+                    rawLog(`[protocol-spawn] no proxy for child ${i + 1}/${count} — skip`);
                     return;
                 }
 
-                const clientLogId =
-                    `${hash || "bot"}-${i + 1}`;
+                const clientLogId = `${hash || "bot"}-${i + 1}`;
 
-                const child =
-                    childProcess.spawn(
-                        process.execPath,
-                        [scriptPath],
-                        {
-                            cwd: __dirname,
-
-                            env: {
-                                ...process.env,
-                                ARRAS_SOCKET_URL:
-                                    socketUrl,
-
-                                ARRAS_CAPTURE_HASH:
-                                    `#${hash}`,
-
-                                ARRAS_BOT_NAME:
-                                    botName,
-
-                                ARRAS_PARTY:
-                                    party,
-
-                                ARRAS_LOG_U:
-                                    "0",
-
-                                ARRAS_CLIENT_LOG_ID:
-                                    clientLogId,
-
-                                ARRAS_PROXY_URL:
-                                    proxyUrl || ""
-                            },
-
-                            stdio: [
-                                "ignore",
-                                "pipe",
-                                "pipe",
-                                "ipc"
-                            ]
-                        }
-                    );
+                const child = childProcess.spawn(process.execPath, [scriptPath], {
+                    cwd: __dirname,
+                    env: {
+                        ...process.env,
+                        ARRAS_SOCKET_URL: socketUrl,
+                        ARRAS_CAPTURE_HASH: `#${hash}`,
+                        ARRAS_BOT_NAME: botName,
+                        ARRAS_PARTY: party,
+                        ARRAS_LOG_U: "0",
+                        ARRAS_CLIENT_LOG_ID: clientLogId,
+                        ARRAS_PROXY_URL: proxyUrl || ""
+                    },
+                    stdio: ["ignore", "pipe", "pipe", "ipc"]
+                });
 
                 session.protocolClients.add(child);
 
                 child.stdout.on("data", noop);
                 child.stderr.on("data", noop);
 
-                child.on(
-                    "error",
-                    () =>
-                        session.protocolClients.delete(child)
-                );
-
-                child.on(
-                    "exit",
-                    () =>
-                        session.protocolClients.delete(child)
-                );
+                child.on("error", () => session.protocolClients.delete(child));
+                child.on("exit", () => session.protocolClients.delete(child));
             }, i * delay);
 
             session.spawnTimers.add(timer);
         }
 
-        rawLog(
-            `[protocol-spawn] parallel queued count=${count} delay=${delay}ms`
-        );
+        rawLog(`[protocol-spawn] parallel queued count=${count} delay=${delay}ms`);
     }
 
     function stopProtocolOnlyClients(session) {
         for (const child of session.protocolClients) {
-            try {
-                child.kill();
-            } catch {}
+            try { child.kill(); } catch {}
         }
 
         session.protocolClients.clear();
     }
 
-    function sendProtocolChild(
-        session,
-        child,
-        message
-    ) {
-        if (
-            !child ||
-            !child.connected ||
-            child.killed ||
-            child.exitCode !== null ||
-            child.signalCode !== null
-        ) {
+    function sendProtocolChild(session, child, message) {
+        if (!child || !child.connected || child.killed || child.exitCode !== null || child.signalCode !== null) {
             session.protocolClients.delete(child);
             return;
         }
 
         try {
-            child.send(
-                message,
-                (error) => {
-                    if (error) {
-                        session.protocolClients.delete(child);
-                    }
+            child.send(message, (error) => {
+                if (error) {
+                    session.protocolClients.delete(child);
                 }
-            );
+            });
         } catch {
             session.protocolClients.delete(child);
         }
     }
 
-    async function resolveSocketUrlOnly(
-        session,
-        ws,
-        hash,
-        options = {}
-    ) {
-        const normalized =
-            String(hash || "")
-                .replace(/^#/, "")
-                .trim();
+    async function resolveSocketUrlOnly(session, ws, hash, options = {}) {
+        const normalized = String(hash || "").replace(/^#/, "").trim();
 
         if (!normalized) {
             if (ws.readyState === 1) {
-                ws.send(
-                    pack([
-                        options.launchProtocol
-                            ? "P"
-                            : "U",
-                        "",
-                        "",
-                        "missing-hash"
-                    ])
-                );
+                ws.send(pack([options.launchProtocol ? "P" : "U", "", "", "missing-hash"]));
             }
-
             return;
         }
 
         try {
-            const direct =
-                await resolveSocketUrlDirect(normalized);
+            const direct = await resolveSocketUrlDirect(normalized);
 
             if (options.launchProtocol) {
-                launchProtocolOnlyClients(
-                    session,
-                    ws,
-                    normalized,
-                    direct.socketUrl,
-                    options
-                );
+                launchProtocolOnlyClients(session, ws, normalized, direct.socketUrl, options);
             }
 
             if (ws.readyState === 1) {
-                ws.send(
-                    pack([
-                        options.launchProtocol
-                            ? "P"
-                            : "U",
-                        normalized,
-                        direct.socketUrl,
-                        null
-                    ])
-                );
+                ws.send(pack([options.launchProtocol ? "P" : "U", normalized, direct.socketUrl, null]));
             }
 
             return;
         } catch {}
 
         try {
-            fs.rmSync(
-                path.join(
-                    __dirname,
-                    "latest-socket-url.txt"
-                ),
-                { force: true }
-            );
+            fs.rmSync(path.join(__dirname, "latest-socket-url.txt"), { force: true });
         } catch {}
 
-        const worker =
-            createBotWorker(session);
+        const worker = createBotWorker(session);
 
         worker.resolveRequest = {
             ws,
             hash: normalized,
-            launchProtocol:
-                Boolean(options.launchProtocol),
+            launchProtocol: Boolean(options.launchProtocol),
             count: options.count,
             botName: options.botName,
             delay: options.delay
@@ -1166,954 +952,391 @@
         let resolverProxyUrl = takeUniqueProxy(session) || "";
         let resolverClearance = null;
         if (resolverProxyUrl) {
-            try { resolverClearance = await getClearance(resolverProxyUrl); }
-            catch (err) { rawLog(`[clearance] resolver fetch failed: ${err.message}`); }
+            try {
+                resolverClearance = await getClearance(resolverProxyUrl);
+            } catch (err) {
+                rawLog(`[clearance] resolver fetch failed: ${err.message}`);
+            }
         }
 
         worker.send({
             type: "start",
-
             config: {
                 id: `resolve-${Date.now()}`,
-
                 proxy: {
                     type: "http",
                     url: resolverProxyUrl
                 },
                 clearance: resolverClearance,
-
                 hash: "#" + normalized,
-
                 name: "resolver",
-
-                stats: [
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    9
-                ],
-
+                stats: [0, 0, 0, 0, 0, 0, 0, 9],
                 type: "manual",
-
                 token: "resolve-url",
-
                 autoFire: false,
                 autoRespawn: false,
-
                 keys: [],
                 keysHold: [],
-
                 tank: "Basic",
-
                 chatSpam: "",
-
-                initialTarget: {
-                    tank:
-                        session.tank || "basic"
-                },
-
+                initialTarget: { tank: session.tank || "basic" },
                 squadId: normalized,
-
                 reconnectAttempts: 0,
-
                 reconnectDelay: 8000,
-
-                arrasCache:
-                    arrasScriptCache,
-
-                wasmCache:
-                    arrasWasmCache
+                arrasCache: arrasScriptCache,
+                wasmCache: arrasWasmCache
             }
         });
     }
 
-    const wss =
-        new WebSocketServer({ server });
+    const wss = new WebSocketServer({ server });
 
-    wss.on(
-        "connection",
-        (ws, req) => {
-            const addr =
-                req.socket.remoteAddress;
+    wss.on("connection", (ws, req) => {
+        const addr = req.socket.remoteAddress;
 
-            if (!sessions.has(addr)) {
-                sessions.set(addr, {
-                    workers: [],
-                    pool: [],
-                    protocolClients:
-                        new Set(),
+        if (!sessions.has(addr)) {
+            sessions.set(addr, {
+                workers: [],
+                pool: [],
+                protocolClients: new Set(),
+                spawnTimers: new Set(),
+                spawnJob: null,
+                nextBotId: 0,
+                tank: "auto6",
+                tanks: [],
+                tankIdx: 0,
+                proxyQueue: [],
+                resolvedHash: null,
+                partyKey: null,
+                playerHash: null,
+                botBuild: "",
+                lastA: null,
+                teamColor: null,
+                ws: null
+            });
+        }
 
-                    spawnTimers:
-                        new Set(),
+        const session = sessions.get(addr);
 
-                    // Active parallel spawn job ({ cancel() }) or null
-                    spawnJob: null,
+        session.ws = ws;
 
-                    nextBotId: 0,
+        let challenge = null;
+        let verified = false;
 
-                    tank: "auto6",
+        const packet = (...args) => {
+            try { ws.send(pack(args)); } catch {}
+        };
 
-                    tanks: [],
+        const close = () => {
+            try { ws.close(); } catch {}
+        };
 
-                    tankIdx: 0,
+        ws.on("message", (msg) => {
+            try {
+                const data = unpack(msg);
+                const type = data.shift();
 
-                    proxyQueue: [],
+                switch (type) {
+                    case "M":
+                        if (challenge || data[0] != 72011) return close();
+                        challenge = randint(0b1000000000, 0b1111111111);
+                        packet("M", challenge);
+                        break;
 
-                    resolvedHash: null,
-                    partyKey: null,
-                    playerHash: null,
-                    botBuild: "",
+                    case "C":
+                        if (data[0] == (challenge ^ 845)) {
+                            verified = true;
+                            resetSessionProxies(session);
+                            fillPool(session);
+                            pushLiveBotCount(session, packet);
+                            if (session._liveStatsTimer) clearInterval(session._liveStatsTimer);
+                            session._liveStatsTimer = setInterval(() => {
+                                if (!verified) return;
+                                pushLiveBotCount(session, packet);
+                            }, 1500);
+                        } else {
+                            close();
+                        }
+                        break;
 
-                    lastA: null,
+                    case "Z":
+                        session.tank = data[0];
+                        if (Array.isArray(session.tank)) {
+                            session.tanks = session.tank;
+                            session.tankIdx = 0;
+                            for (const w of session.workers) {
+                                for (const id of w.botIds) {
+                                    const t = session.tanks[session.tankIdx];
+                                    w.send({ type: "tankselect", tank: t, botId: id });
+                                    session.tankIdx = (session.tankIdx + 1) % session.tanks.length;
+                                }
+                            }
+                            let pIdx = 0;
+                            for (const child of session.protocolClients) {
+                                const t = session.tanks[pIdx];
+                                sendProtocolChild(session, child, { type: "tankselect", tank: t });
+                                pIdx = (pIdx + 1) % session.tanks.length;
+                            }
+                        } else {
+                            session.tanks = [];
+                            for (const w of session.workers) {
+                                w.send({ type: "tankselect", tank: session.tank });
+                            }
+                            for (const child of session.protocolClients) {
+                                sendProtocolChild(session, child, { type: "tankselect", tank: session.tank });
+                            }
+                        }
+                        break;
 
-                    teamColor: null,
+                    case "F":
+                        if (!verified) break;
+                        {
+                            const hash = data[0];
+                            let count = 1;
+                            let botName = "";
+                            const a = data[1];
+                            const b = data[2];
 
-                    ws: null
-                });
+                            if (typeof a === "number" || (typeof a === "string" && /^\d+$/.test(String(a)))) {
+                                count = Math.max(1, parseInt(a, 10) || 1);
+                                botName = b === undefined || b === null ? "" : String(b).trim();
+                            } else if (typeof b === "number" || (typeof b === "string" && /^\d+$/.test(String(b)))) {
+                                botName = a === undefined || a === null ? "" : String(a).trim();
+                                count = Math.max(1, parseInt(b, 10) || 1);
+                            } else {
+                                const raw = a ?? b;
+                                botName = raw === undefined || raw === null ? "" : String(raw).trim();
+                                count = 1;
+                            }
+
+                            count = Math.min(count, 10000);
+
+                            {
+                                const buildRaw = data[3];
+                                if (buildRaw !== undefined && buildRaw !== null) {
+                                    const build = String(buildRaw).trim();
+                                    if (!build || /^[0-9]+(\/[0-9]+)*$/.test(build)) {
+                                        session.botBuild = build;
+                                    }
+                                }
+                            }
+
+                            spawnBatch(session, hash, botName, count, false);
+                            pushLiveBotCount(session, packet);
+                        }
+                        break;
+
+                    case "D":
+                        if (!verified) break;
+                        {
+                            const hash = data[0];
+                            const count = Math.min(Math.max(1, parseInt(data[1], 10) || 1), 10000);
+                            const botName = data[2] === undefined || data[2] === null ? "" : String(data[2]).trim();
+
+                            session.tanks = ["octo", "gale", "automingler"];
+                            session.tankIdx = 0;
+
+                            spawnBatch(session, hash, botName, count, true);
+                            pushLiveBotCount(session, packet);
+                        }
+                        break;
+
+                    case "U":
+                        if (!verified) break;
+                        resolveSocketUrlOnly(session, ws, data[0]);
+                        break;
+
+                    case "P":
+                        if (!verified) break;
+                        {
+                            const hash = data[0];
+                            const count = Math.max(1, parseInt(data[1], 10) || 1);
+                            const botName = data[2] === undefined || data[2] === null ? "" : String(data[2]).trim();
+                            const requestedDelay = parseInt(data[3], 10);
+
+                            const options = { launchProtocol: true, count, botName };
+                            if (Number.isFinite(requestedDelay) && requestedDelay > 0) {
+                                options.delay = requestedDelay;
+                            }
+
+                            resolveSocketUrlOnly(session, ws, hash, options);
+                        }
+                        break;
+
+                    case "B":
+                        if (!verified) break;
+                        for (const w of session.workers) {
+                            try { w.terminate(); } catch {}
+                            w.botIds = [];
+                            w.activeBots = 0;
+                        }
+                        session.workers = [];
+                        for (const timer of session.spawnTimers) clearTimeout(timer);
+                        session.spawnTimers.clear();
+                        if (session.spawnJob) {
+                            try { session.spawnJob.cancel(); } catch {}
+                            session.spawnJob = null;
+                        }
+                        stopProtocolOnlyClients(session);
+                        totalSpawned = 0;
+                        activeBotCount = 0;
+                        for (const s of sessions.values()) {
+                            for (const w of s.workers) activeBotCount += w.activeBots;
+                            for (const w of s.pool) activeBotCount += w.activeBots;
+                        }
+                        resetSessionProxies(session);
+                        fillPool(session);
+                        pushLiveBotCount(session, packet);
+                        break;
+
+                    case "A":
+                        if (!verified) break;
+                        {
+                            const payload = {
+                                type: "position",
+                                x: data[0], y: data[1],
+                                mouseX: data[2], mouseY: data[3],
+                                mouseDown: data[4], rMouseDown: data[5],
+                                mouse: data[6],
+                                feeding: data[7] ? 1 : 0,
+                                shift: data[8],
+                                autofire: data[9] ? 1 : 0,
+                                autospin: data[10] ? 1 : 0,
+                                manualMode: data[11],
+                                manualX: data[12], manualY: data[13],
+                                noMove: data[14] ? 1 : 0,
+                                override: data[15] ? 1 : 0,
+                                wavy: data[16] === undefined ? undefined : data[16] ? 1 : 0,
+                                wavyAmp: data[17],
+                                wavyFreq: data[18],
+                                copyAim: data[19] ? 1 : 0,
+                                teamColor: session.teamColor
+                            };
+
+                            const defenderPayload = {
+                                type: "position",
+                                x: data[0], y: data[1],
+                                mouseX: data[2], mouseY: data[3],
+                                mouseDown: data[4], rMouseDown: data[5],
+                                mouse: true,
+                                feeding: 0,
+                                shift: data[8],
+                                autofire: data[9] ? 1 : 0,
+                                autospin: data[10] ? 1 : 0,
+                                override: data[15] ? 1 : 0,
+                                copyAim: data[19] ? 1 : 0,
+                                manualMode: false,
+                                manualX: 0, manualY: 0,
+                                noMove: false,
+                                teamColor: session.teamColor
+                            };
+
+                            session.lastA = { payload, defenderPayload };
+
+                            for (const w of session.workers) {
+                                w.send(w.isDefender ? defenderPayload : payload);
+                            }
+
+                            for (const child of session.protocolClients) {
+                                sendProtocolChild(session, child, payload);
+                            }
+                        }
+                        break;
+
+                    case "T":
+                        if (!verified) break;
+                        {
+                            const payload = { type: "chat", message: data[0], spam: data[1] };
+                            for (const w of session.workers) {
+                                w.send(payload);
+                            }
+                        }
+                        break;
+
+                    case "H":
+                        if (!verified) break;
+                        {
+                            const team = String(data[0] || "").toLowerCase().trim();
+                            if (["green", "blue", "pink", "purple"].includes(team) && session.teamColor !== team) {
+                                session.teamColor = team;
+                                for (const w of session.workers) {
+                                    w.send({ type: "teamcolor", teamColor: team });
+                                }
+                            }
+                        }
+                        break;
+
+                    case "G":
+                        if (!verified) break;
+                        {
+                            const huntName = String(data[0] ?? "").trim();
+                            const huntCount = parseInt(data[1], 10) || 0;
+                            for (const w of session.workers) {
+                                w.send({ type: "huntname", name: huntName, count: huntCount });
+                            }
+                        }
+                        break;
+
+                    case "Y":
+                        if (!verified) break;
+                        {
+                            const enabled = !!data[0];
+                            let lyrics = null;
+                            if (Array.isArray(data[1])) {
+                                lyrics = data[1];
+                            } else if (typeof data[1] === "string" && data[1].trim()) {
+                                lyrics = data[1].split("\n").map((s) => s.trim()).filter(Boolean);
+                            }
+                            const delay = parseInt(data[2], 10) || 4000;
+                            for (const w of session.workers) {
+                                w.send({ type: "sing", enabled, lyrics, delay });
+                            }
+                        }
+                        break;
+
+                    default:
+                        break;
+                }
+            } catch {}
+        });
+
+        ws.on("close", () => {
+            for (const w of session.workers) {
+                try { w.terminate(); } catch {}
             }
 
-            const session =
-                sessions.get(addr);
+            session.workers = [];
+            session.pool = [];
 
-            session.ws = ws;
+            stopProtocolOnlyClients(session);
 
-            let challenge = null;
-            let verified = false;
+            for (const timer of session.spawnTimers) clearTimeout(timer);
+            session.spawnTimers.clear();
 
-            const packet = (...args) => {
-                try {
-                    ws.send(pack(args));
-                } catch {}
-            };
+            if (session.spawnJob) {
+                try { session.spawnJob.cancel(); } catch {}
+                session.spawnJob = null;
+            }
 
-            const close = () => {
-                try {
-                    ws.close();
-                } catch {}
-            };
+            sessions.delete(addr);
 
-            ws.on(
-                "message",
-                (msg) => {
-                    try {
-                        const data =
-                            unpack(msg);
+            activeBotCount = 0;
+            for (const s of sessions.values()) {
+                for (const w of s.workers) activeBotCount += w.activeBots;
+                for (const w of s.pool) activeBotCount += w.activeBots;
+            }
+        });
 
-                        const type =
-                            data.shift();
+        ws.on("error", noop);
+    });
 
-                        switch (type) {
-                            case "M":
-                                if (
-                                    challenge ||
-                                    data[0] != 72011
-                                ) {
-                                    return close();
-                                }
-
-                                challenge =
-                                    randint(
-                                        0b1000000000,
-                                        0b1111111111
-                                    );
-
-                                packet(
-                                    "M",
-                                    challenge
-                                );
-
-                                break;
-
-                            case "C":
-                                if (
-                                    data[0] ==
-                                    (challenge ^ 845)
-                                ) {
-                                    verified = true;
-
-                                    resetSessionProxies(
-                                        session
-                                    );
-
-                                    fillPool(
-                                        session
-                                    );
-
-                                    // Live bot count → controller (sums across workflows on client)
-                                    pushLiveBotCount(session, packet);
-                                    if (session._liveStatsTimer) {
-                                        clearInterval(session._liveStatsTimer);
-                                    }
-                                    session._liveStatsTimer = setInterval(() => {
-                                        if (!verified) return;
-                                        pushLiveBotCount(session, packet);
-                                    }, 1500);
-                                } else {
-                                    close();
-                                }
-
-                                break;
-
-                            case "Z":
-                                session.tank =
-                                    data[0];
-
-                                if (
-                                    Array.isArray(
-                                        session.tank
-                                    )
-                                ) {
-                                    session.tanks =
-                                        session.tank;
-
-                                    session.tankIdx = 0;
-
-                                    for (
-                                        const w
-                                        of session.workers
-                                    ) {
-                                        for (
-                                            const id
-                                            of w.botIds
-                                        ) {
-                                            const t =
-                                                session.tanks[
-                                                    session.tankIdx
-                                                ];
-
-                                            w.send({
-                                                type:
-                                                    "tankselect",
-                                                tank: t,
-                                                botId: id
-                                            });
-
-                                            session.tankIdx =
-                                                (
-                                                    session.tankIdx +
-                                                    1
-                                                ) %
-                                                session.tanks.length;
-                                        }
-                                    }
-
-                                    let pIdx = 0;
-
-                                    for (
-                                        const child
-                                        of session.protocolClients
-                                    ) {
-                                        const t =
-                                            session.tanks[
-                                                pIdx
-                                            ];
-
-                                        sendProtocolChild(
-                                            session,
-                                            child,
-                                            {
-                                                type:
-                                                    "tankselect",
-                                                tank: t
-                                            }
-                                        );
-
-                                        pIdx =
-                                            (
-                                                pIdx + 1
-                                            ) %
-                                            session.tanks.length;
-                                    }
-                                } else {
-                                    session.tanks = [];
-
-                                    for (
-                                        const w
-                                        of session.workers
-                                    ) {
-                                        w.send({
-                                            type:
-                                                "tankselect",
-                                            tank:
-                                                session.tank
-                                        });
-                                    }
-
-                                    for (
-                                        const child
-                                        of session.protocolClients
-                                    ) {
-                                        sendProtocolChild(
-                                            session,
-                                            child,
-                                            {
-                                                type:
-                                                    "tankselect",
-                                                tank:
-                                                    session.tank
-                                            }
-                                        );
-                                    }
-                                }
-
-                                break;
-
-                            case "F":
-                                if (!verified) break;
-
-                                {
-                                    const hash =
-                                        data[0];
-
-                                    let count = 1;
-
-                                    let botName = "";
-
-                                    const a =
-                                        data[1];
-
-                                    const b =
-                                        data[2];
-
-                                    if (
-                                        typeof a ===
-                                            "number" ||
-                                        (
-                                            typeof a ===
-                                            "string" &&
-                                            /^\d+$/.test(
-                                                String(a)
-                                            )
-                                        )
-                                    ) {
-                                        count =
-                                            Math.max(
-                                                1,
-                                                parseInt(
-                                                    a,
-                                                    10
-                                                ) || 1
-                                            );
-
-                                        botName =
-                                            b === undefined || b === null
-                                                ? ""
-                                                : String(b).trim();
-                                    } else if (
-                                        typeof b ===
-                                            "number" ||
-                                        (
-                                            typeof b ===
-                                            "string" &&
-                                            /^\d+$/.test(
-                                                String(b)
-                                            )
-                                        )
-                                    ) {
-                                        botName =
-                                            a === undefined || a === null
-                                                ? ""
-                                                : String(a).trim();
-
-                                        count =
-                                            Math.max(
-                                                1,
-                                                parseInt(
-                                                    b,
-                                                    10
-                                                ) || 1
-                                            );
-                                    } else {
-                                        // Name-only / ambiguous form — empty allowed (unnamed)
-                                        const raw = a ?? b;
-                                        botName =
-                                            raw === undefined || raw === null
-                                                ? ""
-                                                : String(raw).trim();
-
-                                        count = 1;
-                                    }
-
-                                    count =
-                                        Math.min(
-                                            count,
-                                            10000
-                                        );
-
-                                    // Optional build on F: data[3] = "0/4/3/8/8/9/7/4"
-                                    {
-                                        const buildRaw = data[3];
-                                        if (buildRaw !== undefined && buildRaw !== null) {
-                                            const build = String(buildRaw).trim();
-                                            if (!build || /^[0-9]+(\/[0-9]+)*$/.test(build)) {
-                                                session.botBuild = build;
-                                            }
-                                        }
-                                    }
-
-                                    spawnBatch(
-                                        session,
-                                        hash,
-                                        botName,
-                                        count,
-                                        false
-                                    );
-                                    pushLiveBotCount(session, packet);
-                                }
-
-                                break;
-
-                            case "D":
-                                // Defender: spawn N bots rotating through
-                                // a fixed tank set (octo -> gale ->
-                                // automingler -> repeat). Always follows
-                                // the player directly (see "A" handler).
-                                if (!verified) break;
-
-                                {
-                                    const hash =
-                                        data[0];
-
-                                    const count =
-                                        Math.min(
-                                            Math.max(
-                                                1,
-                                                parseInt(
-                                                    data[1],
-                                                    10
-                                                ) || 1
-                                            ),
-                                            10000
-                                        );
-
-                                    const botName =
-                                        data[2] === undefined || data[2] === null
-                                            ? ""
-                                            : String(data[2]).trim();
-
-                                    session.tanks = [
-                                        "octo",
-                                        "gale",
-                                        "automingler"
-                                    ];
-
-                                    session.tankIdx = 0;
-
-                                                                        spawnBatch(
-                                        session,
-                                        hash,
-                                        botName,
-                                        count,
-                                        true
-                                    );
-                                    pushLiveBotCount(session, packet);
-                                }
-
-                                break;
-
-                            case "U":
-                                if (!verified) break;
-
-                                resolveSocketUrlOnly(
-                                    session,
-                                    ws,
-                                    data[0]
-                                );
-
-                                break;
-
-                            case "P":
-                                if (!verified) break;
-
-                                {
-                                    const hash =
-                                        data[0];
-
-                                    const count =
-                                        Math.max(
-                                            1,
-                                            parseInt(
-                                                data[1],
-                                                10
-                                            ) || 1
-                                        );
-
-                                    const botName =
-                                        data[2] === undefined || data[2] === null
-                                            ? ""
-                                            : String(data[2]).trim();
-
-                                    const requestedDelay =
-                                        parseInt(
-                                            data[3],
-                                            10
-                                        );
-
-                                    const options = {
-                                        launchProtocol:
-                                            true,
-                                        count,
-                                        botName
-                                    };
-
-                                    if (
-                                        Number.isFinite(
-                                            requestedDelay
-                                        ) &&
-                                        requestedDelay > 0
-                                    ) {
-                                        options.delay =
-                                            requestedDelay;
-                                    }
-
-                                    resolveSocketUrlOnly(
-                                        session,
-                                        ws,
-                                        hash,
-                                        options
-                                    );
-                                }
-
-                                break;
-
-                            case "B":
-                                if (!verified) break;
-
-                                for (
-                                    const w
-                                    of session.workers
-                                ) {
-                                    // Force-terminate immediately instead of
-                                    // waiting for the worker to receive and
-                                    // process a "destroy" message on its own
-                                    // schedule — this is a hard, synchronous
-                                    // kill of the whole worker thread.
-                                    try {
-                                        w.terminate();
-                                    } catch {}
-
-                                    w.botIds = [];
-                                    w.activeBots = 0;
-                                }
-
-                                session.workers = [];
-
-                                for (
-                                    const timer
-                                    of session.spawnTimers
-                                ) {
-                                    clearTimeout(timer);
-                                }
-
-                                session.spawnTimers.clear();
-
-                                if (session.spawnJob) {
-                                    try { session.spawnJob.cancel(); } catch {}
-                                    session.spawnJob = null;
-                                }
-
-                                stopProtocolOnlyClients(
-                                    session
-                                );
-
-                                totalSpawned = 0;
-
-                                // Recompute the live count from the sessions
-                                // that kept running — the terminated workers
-                                // above are already gone, so a nuke can't leave
-                                // an inflated count blocking new spawns.
-                                activeBotCount = 0;
-                                for (const s of sessions.values()) {
-                                    for (const w of s.workers) {
-                                        activeBotCount += w.activeBots;
-                                    }
-                                    for (const w of s.pool) {
-                                        activeBotCount += w.activeBots;
-                                    }
-                                }
-
-                                resetSessionProxies(
-                                    session
-                                );
-
-                                fillPool(
-                                    session
-                                );
-
-                                pushLiveBotCount(session, packet);
-
-                                break;
-
-                            case "A":
-                                if (!verified) break;
-
-                                {
-                                    const payload = {
-                                        type:
-                                            "position",
-
-                                        x: data[0],
-                                        y: data[1],
-
-                                        mouseX:
-                                            data[2],
-
-                                        mouseY:
-                                            data[3],
-
-                                        mouseDown:
-                                            data[4],
-
-                                        rMouseDown:
-                                            data[5],
-
-                                        mouse:
-                                            data[6],
-
-                                        feeding:
-                                            data[7]
-                                                ? 1
-                                                : 0,
-
-                                        shift:
-                                            data[8],
-
-                                        autofire:
-                                            data[9]
-                                                ? 1
-                                                : 0,
-
-                                        autospin:
-                                            data[10]
-                                                ? 1
-                                                : 0,
-
-                                        manualMode:
-                                            data[11],
-
-                                        manualX:
-                                            data[12],
-
-                                        manualY:
-                                            data[13],
-
-                                        noMove:
-                                            data[14]
-                                                ? 1
-                                                : 0,
-
-                                        // R override (same pattern as E autofire @ data[9])
-                                        override:
-                                            data[15]
-                                                ? 1
-                                                : 0,
-
-                                        wavy:
-                                            data[16] === undefined
-                                                ? undefined
-                                                : data[16]
-                                                    ? 1
-                                                    : 0,
-                                        wavyAmp: data[17],
-                                        wavyFreq: data[18],
-                                        // Match leader aim direction on each bot
-                                        copyAim:
-                                            data[19]
-                                                ? 1
-                                                : 0,
-
-                                        teamColor:
-                                            session.teamColor
-                                    };
-
-                                    // Defender bots always chase the
-                                    // player's real x/y directly — never
-                                    // manual coords, never noMove, never
-                                    // whatever formation offset was baked
-                                    // into the regular payload's x/y.
-                                    const defenderPayload = {
-                                        type:
-                                            "position",
-
-                                        x: data[0],
-                                        y: data[1],
-
-                                        mouseX:
-                                            data[2],
-
-                                        mouseY:
-                                            data[3],
-
-                                        mouseDown:
-                                            data[4],
-
-                                        rMouseDown:
-                                            data[5],
-
-                                        mouse: true,
-
-                                        feeding: 0,
-
-                                        shift:
-                                            data[8],
-
-                                        autofire:
-                                            data[9]
-                                                ? 1
-                                                : 0,
-
-                                        autospin:
-                                            data[10]
-                                                ? 1
-                                                : 0,
-
-                                        override:
-                                            data[15]
-                                                ? 1
-                                                : 0,
-
-                                        copyAim:
-                                            data[19]
-                                                ? 1
-                                                : 0,
-
-                                        manualMode: false,
-                                        manualX: 0,
-                                        manualY: 0,
-
-                                        noMove: false,
-
-                                        teamColor:
-                                            session.teamColor
-                                    };
-
-                                    // Remember the latest validated position
-                                    // packet so brand-new bots can be seeded
-                                    // with it on spawn (no more idle "waiting
-                                    // for WASD" until the next A packet).
-                                    session.lastA = {
-                                        payload,
-                                        defenderPayload
-                                    };
-
-                                    for (
-                                        const w
-                                        of session.workers
-                                    ) {
-                                        w.send(
-                                            w.isDefender
-                                                ? defenderPayload
-                                                : payload
-                                        );
-                                    }
-
-                                    for (
-                                        const child
-                                        of session.protocolClients
-                                    ) {
-                                        sendProtocolChild(
-                                            session,
-                                            child,
-                                            payload
-                                        );
-                                    }
-                                }
-
-                                break;
-
-                            case "T":
-                                if (!verified) break;
-
-                                {
-                                    const payload = {
-                                        type: "chat",
-                                        message: data[0],
-                                        spam: data[1]
-                                    };
-
-                                    for (
-                                        const w
-                                        of session.workers
-                                    ) {
-                                        w.send(
-                                            payload
-                                        );
-                                    }
-                                }
-
-                                break;
-
-                            case "H":
-                                if (!verified) break;
-
-                                {
-                                    const team =
-                                        String(
-                                            data[0] || ""
-                                        )
-                                            .toLowerCase()
-                                            .trim();
-
-                                    if (
-                                        [
-                                            "green",
-                                            "blue",
-                                            "pink",
-                                            "purple"
-                                        ].includes(
-                                            team
-                                        ) &&
-                                        session.teamColor !==
-                                            team
-                                    ) {
-                                        session.teamColor =
-                                            team;
-
-                                        for (
-                                            const w
-                                            of session.workers
-                                        ) {
-                                            w.send({
-                                                type:
-                                                    "teamcolor",
-                                                teamColor:
-                                                    team
-                                            });
-                                        }
-                                    }
-                                }
-
-                                break;
-
-                            case "G":
-                                if (!verified) break;
-
-                                {
-                                    const huntName =
-                                        String(
-                                            data[0] ??
-                                            ""
-                                        ).trim();
-
-                                    const huntCount =
-                                        parseInt(
-                                            data[1],
-                                            10
-                                        ) || 0;
-
-                                    for (
-                                        const w
-                                        of session.workers
-                                    ) {
-                                        w.send({
-                                            type:
-                                                "huntname",
-                                            name:
-                                                huntName,
-                                            count:
-                                                huntCount
-                                        });
-                                    }
-                                }
-
-                                break;
-
-                            case "Y":
-                                // Sing: data[0]=on/off, data[1]=lyrics array|newline string, data[2]=delay ms
-                                if (!verified) break;
-                                {
-                                    const enabled = !!data[0];
-                                    let lyrics = null;
-                                    if (Array.isArray(data[1])) {
-                                        lyrics = data[1];
-                                    } else if (typeof data[1] === "string" && data[1].trim()) {
-                                        lyrics = data[1].split("\n").map((s) => s.trim()).filter(Boolean);
-                                    }
-                                    const delay = parseInt(data[2], 10) || 4000;
-                                    for (const w of session.workers) {
-                                        w.send({ type: "sing", enabled, lyrics, delay });
-                                    }
-                                }
-                                break;
-
-                            default:
-                                break;
-                        }
-                    } catch {}
-                }
-            );
-
-            ws.on(
-                "close",
-                () => {
-                    for (
-                        const w
-                        of session.workers
-                    ) {
-                        try {
-                            w.terminate();
-                        } catch {}
-                    }
-
-                    session.workers = [];
-                    session.pool = [];
-
-                    stopProtocolOnlyClients(
-                        session
-                    );
-
-                    for (
-                        const timer
-                        of session.spawnTimers
-                    ) {
-                        clearTimeout(timer);
-                    }
-
-                    session.spawnTimers.clear();
-
-                    if (session.spawnJob) {
-                        try { session.spawnJob.cancel(); } catch {}
-                        session.spawnJob = null;
-                    }
-
-                    sessions.delete(addr);
-
-                    // Recompute the global count from the sessions that
-                    // survived the disconnect.
-                    activeBotCount = 0;
-                    for (const s of sessions.values()) {
-                        for (const w of s.workers) {
-                            activeBotCount += w.activeBots;
-                        }
-                        for (const w of s.pool) {
-                            activeBotCount += w.activeBots;
-                        }
-                    }
-                }
-            );
-
-            ws.on("error", noop);
-        }
-    );
-
-    // Fire-and-forget — server listens immediately, caches fill in async.
-    // Workers self-load arras.io assets when the caches are still null.
     fetchProxies();
     preloadArrasAssets();
 
-    // Keep the proxy pool fresh — 1500 bots burn through proxies on every
-    // reconnect/respawn, so a one-shot fetch starves after a few minutes.
-    // No rankProxies here: ranking is defender-only and gets kicked from
-    // the defender spawn path when it's actually needed.
     setInterval(() => {
         fetchProxies();
     }, PROXY_REFRESH_MS);
 
-    // Cheap liveness telemetry so long runs can be observed.
     setInterval(() => {
         let workerCount = 0;
         for (const s of sessions.values()) {
@@ -2133,9 +1356,7 @@
                 try { w.terminate(); } catch {}
             }
             stopProtocolOnlyClients(session);
-            for (const timer of session.spawnTimers) {
-                clearTimeout(timer);
-            }
+            for (const timer of session.spawnTimers) clearTimeout(timer);
             if (session.spawnJob) {
                 try { session.spawnJob.cancel(); } catch {}
                 session.spawnJob = null;
@@ -2150,8 +1371,7 @@
     process.once("SIGINT", () => shutdown("SIGINT"));
     process.once("SIGTERM", () => shutdown("SIGTERM"));
 
-    const port =
-        process.env.PORT || 8082;
+    const port = process.env.PORT || 8082;
 
     server.listen(port, async () => {
         const codespaceName = process.env.CODESPACE_NAME;
